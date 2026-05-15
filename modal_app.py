@@ -5,8 +5,10 @@ NOT auto-deployed by CI — this file is the operator handoff. To actually deplo
     modal deploy modal_app.py
 
 The deployer is responsible for provisioning the runtime secrets:
-``XAI_API_KEY`` and ``GATEWAY_AUTH_TOKEN``. Don't ship without them — the gateway
-will reject every request otherwise.
+``XAI_API_KEY``, ``GATEWAY_AUTH_TOKEN``, ``ADMIN_AUTH_TOKEN``, ``DATABASE_URL``
+(point at a managed Postgres — Supabase / RDS / etc.). Without those the
+gateway will reject inbound requests OR fall back to in-memory logging that
+doesn't survive a restart.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ image = (
         "pydantic==2.10.4",
         "pydantic-settings==2.7.0",
         "httpx==0.27.2",
+        "asyncpg==0.30.0",
     )
     .env({"GIT_COMMIT": _GIT_COMMIT, "ENV": "production"})
     .add_local_dir("api", remote_path="/root/api")
@@ -40,7 +43,7 @@ image = (
 
 app = modal.App("pagehub-llm-gateway", image=image)
 
-MODAL_FUNCTION_TIMEOUT = 700  # >= PROVIDER_TIMEOUT_SECONDS + headroom for slow Grok responses
+MODAL_FUNCTION_TIMEOUT = 700  # >= PROVIDER_TIMEOUT_SECONDS + headroom
 CONCURRENT_INPUTS = 32
 
 

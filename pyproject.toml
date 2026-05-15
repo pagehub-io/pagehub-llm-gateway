@@ -12,6 +12,7 @@ dependencies = [
     "pydantic==2.10.4",
     "pydantic-settings==2.7.0",
     "httpx==0.27.2",
+    "asyncpg==0.30.0",
 ]
 
 [project.optional-dependencies]
@@ -23,7 +24,17 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["api", "api.providers", "api.translation", "api.v1"]
+packages = [
+    "api",
+    "api.canonical",
+    "api.protocols",
+    "api.providers",
+    "api.shared",
+    "api.v1",
+]
+
+[tool.setuptools.package-data]
+"api.shared" = ["schema.sql"]
 
 [tool.ruff]
 line-length = 110
@@ -36,3 +47,6 @@ ignore = ["E501"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "db: integration tests that require a live Postgres at DATABASE_URL",
+]

@@ -1,11 +1,13 @@
-"""Gateway authentication — accept either ``x-api-key`` or ``Authorization: Bearer``.
+"""Gateway authentication.
 
-Claude Code's CLI sets ``ANTHROPIC_AUTH_TOKEN`` and sends it as a Bearer token; the
-official Anthropic SDKs send ``x-api-key``. We accept both so any caller that thinks
-it's talking to Anthropic works without modification.
+- ``require_auth``: caller auth for /v1/messages and /v1/models. Accepts
+  ``x-api-key`` (Anthropic SDK) OR ``Authorization: Bearer`` (Claude Code's
+  ``ANTHROPIC_AUTH_TOKEN``). Compared constant-time against
+  ``GATEWAY_AUTH_TOKEN``.
 
-Constant-time compare against ``GATEWAY_AUTH_TOKEN`` so a wrong-length token doesn't
-leak length via timing.
+- ``require_admin_auth``: admin auth for /v1/admin/*. Accepts the SAME
+  header schemes but compared against ``ADMIN_AUTH_TOKEN`` (a separate token,
+  intentionally — a leaked caller token must not read request history).
 """
 
 from __future__ import annotations
@@ -29,17 +31,11 @@ def _extract_presented_token(request: Request) -> str | None:
     return None
 
 
-async def require_auth(request: Request) -> None:
-    expected = settings.gateway_auth_token
+def _enforce(expected: str, request: Request, *, missing_token_message: str) -> None:
     if not expected:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": {
-                    "type": "configuration_error",
-                    "message": "GATEWAY_AUTH_TOKEN is not configured.",
-                }
-            },
+            detail={"error": {"type": "configuration_error", "message": missing_token_message}},
         )
     presented = _extract_presented_token(request)
     if not presented or not hmac.compare_digest(presented, expected):
@@ -52,3 +48,19 @@ async def require_auth(request: Request) -> None:
                 }
             },
         )
+
+
+async def require_auth(request: Request) -> None:
+    _enforce(
+        settings.gateway_auth_token,
+        request,
+        missing_token_message="GATEWAY_AUTH_TOKEN is not configured.",
+    )
+
+
+async def require_admin_auth(request: Request) -> None:
+    _enforce(
+        settings.admin_auth_token,
+        request,
+        missing_token_message="ADMIN_AUTH_TOKEN is not configured.",
+    )

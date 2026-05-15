@@ -1,20 +1,47 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    # Port 5534 on the host — 5532/5533 are taken by pagehub/pagehub-evals locally.
+    # Coordinate any new ports across pagehub-* services to avoid collisions.
+    ports:
+      - "5534:5432"
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
   pagehub-llm-gateway:
     build:
       context: .
       args:
         GIT_COMMIT: ${GIT_COMMIT:-local-dev}
     image: pagehub-llm-gateway:local
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "4011:4011"
     # .env holds non-secret defaults (ENV, GROK_BASE_URL, GROK_DEFAULT_MODEL, ...).
-    # Anything you export from your shell (~/.bashrc) and list under `environment:`
-    # below takes precedence — drop XAI_API_KEY / GATEWAY_AUTH_TOKEN there so the
-    # secrets never need to live in a file.
+    # Secrets exported in your shell take precedence — see README "Run locally".
     env_file:
       - .env
     environment:
       ENV: ${ENV:-development}
       XAI_API_KEY: ${XAI_API_KEY:-}
       GATEWAY_AUTH_TOKEN: ${GATEWAY_AUTH_TOKEN:-}
+      ADMIN_AUTH_TOKEN: ${ADMIN_AUTH_TOKEN:-}
+      # Container-to-container DSN. Override DATABASE_URL in the shell if you want
+      # to point at a remote Postgres (e.g. a Supabase staging DSN).
+      DATABASE_URL: ${DATABASE_URL:-postgresql://gateway:gateway@postgres:5432/gateway}
     restart: unless-stopped
+
+volumes:
+  postgres_data:

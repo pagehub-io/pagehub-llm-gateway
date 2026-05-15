@@ -1,0 +1,573 @@
+"""XAIProvider — xAI Grok speaks the OpenAI chat-completions wire format.
+
+This adapter implements both halves of the canonical boundary AND the HTTP
+transport. The HTTP layer is configurable for tests via the optional ``client``
+kwarg (an ``httpx.AsyncClient`` with a MockTransport).
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator
+
+import httpx
+
+from api.canonical.events import (
+    ContentBlockDone,
+    ContentBlockStart,
+    ContentTextDelta,
+    ContentToolCallDelta,
+    MessageDelta,
+    StreamDone,
+    StreamError,
+    StreamStart,
+)
+from api.canonical.types import (
+    CanonicalImage,
+    CanonicalRequest,
+    CanonicalResponse,
+    CanonicalText,
+    CanonicalToolCall,
+    CanonicalToolResult,
+    CanonicalUsage,
+)
+from api.config import settings
+from api.providers.base import ProviderError
+from api.twin import get_override
+
+# ---------------------------------------------------------------------------
+# OpenAI / xAI finish_reason <-> canonical stop_reason
+# ---------------------------------------------------------------------------
+
+_FINISH_REASON_MAP = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+    "function_call": "tool_use",
+    "content_filter": "stop_sequence",
+}
+
+
+def _map_finish_reason(fr: str | None) -> str | None:
+    if fr is None:
+        return None
+    return _FINISH_REASON_MAP.get(fr, "end_turn")
+
+
+# ---------------------------------------------------------------------------
+# Canonical -> OpenAI body
+# ---------------------------------------------------------------------------
+
+
+def _encode_user_blocks(blocks) -> list[dict[str, Any]]:
+    """A user-role canonical message may interleave Text/Image and ToolResult blocks.
+    ToolResults become standalone OpenAI ``role:"tool"`` messages; the rest become a
+    single ``role:"user"`` message, preserving original order."""
+
+    out: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        if not pending:
+            return
+        if len(pending) == 1 and pending[0].get("type") == "text":
+            out.append({"role": "user", "content": pending[0]["text"]})
+        else:
+            out.append({"role": "user", "content": list(pending)})
+        pending.clear()
+
+    for b in blocks:
+        if isinstance(b, CanonicalText):
+            pending.append({"type": "text", "text": b.text})
+        elif isinstance(b, CanonicalImage):
+            url = b.url or (f"data:{b.media_type};base64,{b.data}" if b.data else None)
+            if url:
+                pending.append({"type": "image_url", "image_url": {"url": url}})
+        elif isinstance(b, CanonicalToolResult):
+            flush()
+            out.append({"role": "tool", "tool_call_id": b.tool_call_id, "content": b.content})
+        elif isinstance(b, CanonicalToolCall):
+            # A tool_call in a user message is non-sensical; drop quietly.
+            continue
+    flush()
+    return out
+
+
+def _encode_assistant_message(blocks) -> dict[str, Any]:
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for b in blocks:
+        if isinstance(b, CanonicalText):
+            text_parts.append(b.text)
+        elif isinstance(b, CanonicalToolCall):
+            tool_calls.append(
+                {
+                    "id": b.id,
+                    "type": "function",
+                    "function": {
+                        "name": b.name,
+                        "arguments": json.dumps(b.input or {}, ensure_ascii=False),
+                    },
+                }
+            )
+    msg: dict[str, Any] = {"role": "assistant"}
+    text = "".join(text_parts)
+    msg["content"] = text if text else None
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    return msg
+
+
+def _encode_tool_choice(tc) -> str | dict[str, Any] | None:
+    if tc is None:
+        return None
+    if tc.mode == "auto":
+        return "auto"
+    if tc.mode == "required":
+        return "required"
+    if tc.mode == "none":
+        return "none"
+    if tc.mode == "tool":
+        return {"type": "function", "function": {"name": tc.name or ""}}
+    return None
+
+
+def encode_request(canonical: CanonicalRequest, *, target_model: str) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = []
+    if canonical.system:
+        system_text = "\n".join(
+            b.text for b in canonical.system if isinstance(b, CanonicalText) and b.text
+        )
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+
+    for m in canonical.messages:
+        if m.role == "user":
+            messages.extend(_encode_user_blocks(m.content_blocks))
+        elif m.role == "assistant":
+            messages.append(_encode_assistant_message(m.content_blocks))
+        else:  # "tool" — canonical doesn't normally emit this, but pass through
+            text = "\n".join(
+                b.content for b in m.content_blocks if isinstance(b, CanonicalToolResult)
+            )
+            if text:
+                messages.append({"role": "tool", "content": text})
+
+    body: dict[str, Any] = {
+        "model": target_model,
+        "messages": messages,
+        "stream": canonical.stream,
+        "max_tokens": canonical.max_tokens,
+    }
+    if canonical.temperature is not None:
+        body["temperature"] = canonical.temperature
+    if canonical.top_p is not None:
+        body["top_p"] = canonical.top_p
+    if canonical.stop_sequences:
+        body["stop"] = list(canonical.stop_sequences)
+
+    if canonical.tools:
+        body["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description or "",
+                    "parameters": t.json_schema or {"type": "object", "properties": {}},
+                },
+            }
+            for t in canonical.tools
+        ]
+    tc = _encode_tool_choice(canonical.tool_choice)
+    if tc is not None:
+        body["tool_choice"] = tc
+
+    if canonical.stream:
+        body["stream_options"] = {"include_usage": True}
+
+    return body
+
+
+# ---------------------------------------------------------------------------
+# OpenAI body -> CanonicalResponse
+# ---------------------------------------------------------------------------
+
+
+def _safe_parse_arguments(args: Any) -> dict[str, Any]:
+    if args is None:
+        return {}
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        if not args.strip():
+            return {}
+        try:
+            parsed = json.loads(args)
+            return parsed if isinstance(parsed, dict) else {"value": parsed}
+        except json.JSONDecodeError:
+            return {"_unparsed_arguments": args}
+    return {"value": args}
+
+
+def decode_response(provider_body: dict[str, Any], *, canonical_model: str) -> CanonicalResponse:
+    choices = provider_body.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {}
+    finish_reason = choice.get("finish_reason")
+
+    blocks: list = []
+    text = message.get("content")
+    if isinstance(text, str) and text:
+        blocks.append(CanonicalText(text=text))
+    elif isinstance(text, list):
+        for part in text:
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                blocks.append(CanonicalText(text=part["text"]))
+
+    for call in message.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") or {}
+        blocks.append(
+            CanonicalToolCall(
+                id=call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                name=fn.get("name") or "",
+                input=_safe_parse_arguments(fn.get("arguments")),
+            )
+        )
+
+    usage_in = provider_body.get("usage") or {}
+    response_id = provider_body.get("id") or f"msg_{uuid.uuid4().hex[:24]}"
+
+    return CanonicalResponse(
+        id=response_id,
+        model=canonical_model,
+        content_blocks=blocks,
+        stop_reason=_map_finish_reason(finish_reason),
+        usage=CanonicalUsage(
+            input_tokens=int(usage_in.get("prompt_tokens") or 0),
+            output_tokens=int(usage_in.get("completion_tokens") or 0),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streaming: OpenAI SSE bytes -> Canonical events
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ToolCallState:
+    canonical_index: int
+    id: str
+    name: str
+    started: bool = False
+    buffered_args: str = ""
+
+
+@dataclass
+class _StreamState:
+    message_id: str
+    model: str
+    text_index: int | None = None
+    text_started: bool = False
+    text_closed: bool = False
+    next_index: int = 0
+    tool_calls: dict[int, _ToolCallState] = field(default_factory=dict)
+    stop_reason: str | None = None
+    output_tokens: int = 0
+    input_tokens: int = 0
+    started_emitted: bool = False
+
+
+async def _iter_sse_data(byte_iter: AsyncIterator[bytes]) -> AsyncIterator[str]:
+    buf = b""
+    async for chunk in byte_iter:
+        buf += chunk
+        while True:
+            sep = buf.find(b"\n\n")
+            sep_len = 2
+            if sep == -1:
+                sep = buf.find(b"\r\n\r\n")
+                sep_len = 4
+                if sep == -1:
+                    break
+            event_bytes = buf[:sep]
+            buf = buf[sep + sep_len :]
+            data_parts: list[str] = []
+            for raw in event_bytes.split(b"\n"):
+                line = raw.rstrip(b"\r")
+                if line.startswith(b"data:"):
+                    data_parts.append(line[5:].lstrip(b" ").decode("utf-8", errors="replace"))
+            if data_parts:
+                yield "\n".join(data_parts)
+
+
+async def decode_stream(
+    raw_chunks: AsyncIterator[bytes], *, canonical_model: str, input_tokens_estimate: int = 0
+):
+    """Yield ``CanonicalStreamEvent``s from an xAI/OpenAI SSE byte stream."""
+
+    state = _StreamState(
+        message_id=f"msg_{uuid.uuid4().hex[:24]}",
+        model=canonical_model,
+        input_tokens=input_tokens_estimate,
+    )
+
+    async for data_str in _iter_sse_data(raw_chunks):
+        if data_str == "[DONE]":
+            break
+        try:
+            payload = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        if not state.started_emitted:
+            upstream_id = payload.get("id")
+            if upstream_id:
+                state.message_id = upstream_id
+            state.started_emitted = True
+            yield StreamStart(
+                message_id=state.message_id,
+                model=state.model,
+                usage_estimate=CanonicalUsage(
+                    input_tokens=state.input_tokens, output_tokens=0
+                ),
+            )
+
+        usage = payload.get("usage")
+        if usage:
+            state.input_tokens = int(usage.get("prompt_tokens") or state.input_tokens)
+            state.output_tokens = int(usage.get("completion_tokens") or state.output_tokens)
+
+        for choice in payload.get("choices") or []:
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                for ev in _handle_text_delta(state, content):
+                    yield ev
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        for ev in _handle_text_delta(state, part.get("text") or ""):
+                            yield ev
+            for tc_chunk in delta.get("tool_calls") or []:
+                if isinstance(tc_chunk, dict):
+                    for ev in _handle_tool_call_delta(state, tc_chunk):
+                        yield ev
+            fr = choice.get("finish_reason")
+            if fr:
+                state.stop_reason = _map_finish_reason(fr) or state.stop_reason
+
+    # finalize
+    if not state.started_emitted:
+        state.started_emitted = True
+        yield StreamStart(
+            message_id=state.message_id,
+            model=state.model,
+            usage_estimate=CanonicalUsage(input_tokens=state.input_tokens, output_tokens=0),
+        )
+    if state.text_started and not state.text_closed and state.text_index is not None:
+        state.text_closed = True
+        yield ContentBlockDone(index=state.text_index)
+    for st in state.tool_calls.values():
+        if st.started:
+            yield ContentBlockDone(index=st.canonical_index)
+    yield MessageDelta(
+        stop_reason=state.stop_reason or "end_turn",
+        usage=CanonicalUsage(
+            input_tokens=state.input_tokens, output_tokens=state.output_tokens
+        ),
+    )
+    yield StreamDone()
+
+
+def _handle_text_delta(state: _StreamState, text: str):
+    if not text:
+        return
+    if not state.text_started:
+        state.text_index = state.next_index
+        state.next_index += 1
+        state.text_started = True
+        yield ContentBlockStart(index=state.text_index, block=CanonicalText(text=""))
+    yield ContentTextDelta(index=state.text_index, text=text)
+
+
+def _handle_tool_call_delta(state: _StreamState, tc_chunk: dict):
+    oai_idx = tc_chunk.get("index")
+    if oai_idx is None:
+        oai_idx = 0
+    fn = tc_chunk.get("function") or {}
+    name = fn.get("name")
+    args_fragment = fn.get("arguments")
+    call_id = tc_chunk.get("id")
+
+    st = state.tool_calls.get(oai_idx)
+    if st is None:
+        if not name and not call_id and not args_fragment:
+            return
+        st = _ToolCallState(
+            canonical_index=state.next_index,
+            id=call_id or f"toolu_{uuid.uuid4().hex[:24]}",
+            name=name or "",
+        )
+        state.tool_calls[oai_idx] = st
+        state.next_index += 1
+    else:
+        if call_id:
+            st.id = call_id
+        if name and not st.name:
+            st.name = name
+
+    if not st.started:
+        if not st.name:
+            if args_fragment:
+                st.buffered_args += args_fragment
+            return
+        if state.text_started and not state.text_closed and state.text_index is not None:
+            state.text_closed = True
+            yield ContentBlockDone(index=state.text_index)
+        st.started = True
+        yield ContentBlockStart(
+            index=st.canonical_index,
+            block=CanonicalToolCall(id=st.id, name=st.name, input={}),
+        )
+        if st.buffered_args:
+            yield ContentToolCallDelta(
+                index=st.canonical_index,
+                id=st.id,
+                name=st.name,
+                partial_input_json=st.buffered_args,
+            )
+            st.buffered_args = ""
+
+    if args_fragment:
+        yield ContentToolCallDelta(
+            index=st.canonical_index,
+            id=st.id,
+            name=st.name,
+            partial_input_json=args_fragment,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Adapter class — encode/decode + HTTP transport
+# ---------------------------------------------------------------------------
+
+
+class XAIProvider:
+    name = "xai"
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout_seconds: float | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._api_key = api_key if api_key is not None else settings.xai_api_key
+        self._configured_base_url = base_url if base_url is not None else settings.grok_base_url
+        self._timeout = (
+            timeout_seconds if timeout_seconds is not None else settings.provider_timeout_seconds
+        )
+        self._client = client  # injectable for tests
+
+    # ------- canonical boundary
+
+    def encode_request(self, canonical: CanonicalRequest) -> dict[str, Any]:
+        return encode_request(canonical, target_model=self.map_model(canonical.model))
+
+    def decode_response(
+        self, provider_body: dict[str, Any], *, canonical_request_model: str
+    ) -> CanonicalResponse:
+        return decode_response(provider_body, canonical_model=canonical_request_model)
+
+    def decode_stream(
+        self, raw_chunks: AsyncIterator[bytes], *, canonical_request_model: str
+    ):
+        return decode_stream(raw_chunks, canonical_model=canonical_request_model)
+
+    def map_model(self, canonical_model: str) -> str:
+        if not canonical_model:
+            return settings.grok_default_model
+        return canonical_model if canonical_model.lower().startswith("grok") else settings.grok_default_model
+
+    # ------- HTTP transport
+
+    def _resolved_base_url(self) -> str:
+        override = get_override("GROK_BASE_URL")
+        return (override or self._configured_base_url).rstrip("/")
+
+    def _headers(self) -> dict[str, str]:
+        if not self._api_key:
+            raise ProviderError(status_code=500, message="XAI_API_KEY not configured on the gateway.")
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def _stream_headers(self) -> dict[str, str]:
+        h = self._headers()
+        h["Accept"] = "text/event-stream"
+        return h
+
+    def _new_client(self) -> httpx.AsyncClient:
+        return self._client or httpx.AsyncClient(timeout=self._timeout)
+
+    async def send(self, provider_body: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self._resolved_base_url()}/chat/completions"
+        client = self._new_client()
+        owns_client = self._client is None
+        try:
+            try:
+                resp = await client.post(url, json=provider_body, headers=self._headers())
+            except httpx.RequestError as exc:
+                raise ProviderError(
+                    status_code=502, message=f"Upstream provider request failed: {exc}"
+                ) from exc
+            if resp.status_code >= 400:
+                raise ProviderError(
+                    status_code=resp.status_code,
+                    message=f"Provider returned {resp.status_code}",
+                    provider_body=resp.text,
+                )
+            return resp.json()
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def send_stream(self, provider_body: dict[str, Any]) -> AsyncIterator[bytes]:
+        url = f"{self._resolved_base_url()}/chat/completions"
+        client = self._new_client()
+        owns_client = self._client is None
+        body = {**provider_body, "stream": True}
+        try:
+            try:
+                async with client.stream(
+                    "POST", url, json=body, headers=self._stream_headers()
+                ) as resp:
+                    if resp.status_code >= 400:
+                        text = (await resp.aread()).decode("utf-8", errors="replace")
+                        raise ProviderError(
+                            status_code=resp.status_code,
+                            message=f"Provider returned {resp.status_code} on stream open",
+                            provider_body=text,
+                        )
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            yield chunk
+            except httpx.RequestError as exc:
+                raise ProviderError(
+                    status_code=502, message=f"Upstream provider request failed: {exc}"
+                ) from exc
+        finally:
+            if owns_client:
+                await client.aclose()
+
+
+def _wrap_stream_error(exc: ProviderError):
+    return StreamError(message=exc.message)
