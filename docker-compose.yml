@@ -1,0 +1,20 @@
+services:
+  pagehub-llm-gateway:
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-local-dev}
+    image: pagehub-llm-gateway:local
+    ports:
+      - "4011:4011"
+    # .env holds non-secret defaults (ENV, GROK_BASE_URL, GROK_DEFAULT_MODEL, ...).
+    # Anything you export from your shell (~/.bashrc) and list under `environment:`
+    # below takes precedence — drop XAI_API_KEY / GATEWAY_AUTH_TOKEN there so the
+    # secrets never need to live in a file.
+    env_file:
+      - .env
+    environment:
+      ENV: ${ENV:-development}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      GATEWAY_AUTH_TOKEN: ${GATEWAY_AUTH_TOKEN:-}
+    restart: unless-stopped
