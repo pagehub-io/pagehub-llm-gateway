@@ -36,6 +36,7 @@ services:
     environment:
       ENV: ${ENV:-development}
       XAI_API_KEY: ${XAI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GATEWAY_AUTH_TOKEN: ${GATEWAY_AUTH_TOKEN:-}
       ADMIN_AUTH_TOKEN: ${ADMIN_AUTH_TOKEN:-}
       # Container-to-container DSN. Override DATABASE_URL in the shell if you want

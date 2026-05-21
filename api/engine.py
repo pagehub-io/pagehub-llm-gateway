@@ -45,15 +45,64 @@ from api.canonical.events import (
 from api.canonical.types import CanonicalRequest, CanonicalResponse
 from api.protocols.anthropic import ANTHROPIC_PROTOCOL, AnthropicInbound
 from api.providers.base import ProviderAdapter, ProviderError
+from api.providers.registry import ProviderRegistry
 from api.shared.recorder import Recorder
 
 logger = logging.getLogger(__name__)
 
 
+class _SingleProviderRegistry:
+    """Test-shim: behaves like ``ProviderRegistry`` but always returns the same
+    provider regardless of model id. Used when the engine is constructed with
+    the legacy ``provider=`` kwarg (most existing tests). The shim's ``pick``
+    contract matches :class:`ProviderRegistry.pick`; production wiring uses the
+    real registry so unknown models fall through to a 400.
+    """
+
+    def __init__(self, provider: ProviderAdapter) -> None:
+        self._provider = provider
+
+    @property
+    def providers(self) -> list[ProviderAdapter]:
+        return [self._provider]
+
+    def pick(self, canonical_model: str) -> ProviderAdapter:  # noqa: ARG002
+        return self._provider
+
+
 class Engine:
-    def __init__(self, *, provider: ProviderAdapter, recorder: Recorder) -> None:
-        self.provider = provider
+    def __init__(
+        self,
+        *,
+        provider: ProviderAdapter | None = None,
+        registry: ProviderRegistry | _SingleProviderRegistry | None = None,
+        recorder: Recorder,
+    ) -> None:
+        """One of ``provider=`` (single backend) or ``registry=`` (model-routed)
+        is required.
+
+        ``provider=`` is the original v1 API and stays supported for tests and
+        anyone embedding the engine with a fixed backend. ``registry=`` is
+        used in production wiring so the engine picks the right adapter per
+        request (xAI for ``grok-*``, OpenAI for ``gpt-*``/``o*``, ...).
+        """
+        if registry is None and provider is None:
+            raise ValueError("Engine requires either provider= or registry=")
+        if registry is not None and provider is not None:
+            raise ValueError("Engine: pass provider= OR registry=, not both")
+        self._registry: ProviderRegistry | _SingleProviderRegistry = (
+            registry if registry is not None else _SingleProviderRegistry(provider)
+        )
+        # Back-compat alias: legacy tests/code may inspect ``.provider``. When
+        # constructed with a registry, no single provider is meaningful, so the
+        # alias is ``None`` and callers must use ``self.provider_for(model)``.
+        self.provider: ProviderAdapter | None = provider
         self.recorder = recorder
+
+    def provider_for(self, canonical_model: str) -> ProviderAdapter:
+        """Routes a canonical model id to its provider. Raises
+        :class:`ProviderError(status_code=400)` if no provider claims it."""
+        return self._registry.pick(canonical_model)
 
     # ------------------------------------------------------------------
     # Non-streaming
@@ -72,23 +121,24 @@ class Engine:
         for caller-side correlation with the recorded events.
         """
 
-        provider_model = self.provider.map_model(canonical_request.model)
+        provider = self.provider_for(canonical_request.model)
+        provider_model = provider.map_model(canonical_request.model)
         rid = await self.recorder.start_request(
             client_request_id=client_request_id,
             inbound_protocol=ANTHROPIC_PROTOCOL,
             inbound_body=raw_inbound_body,
             canonical_request=canonical_request.model_dump(exclude_none=True),
-            provider=self.provider.name,
+            provider=provider.name,
             provider_model_requested=provider_model,
         )
         await self.recorder.add_event(rid, "inbound_received", raw_inbound_body)
         await self.recorder.add_event(rid, "decoded_canonical", canonical_request.model_dump(exclude_none=True))
 
-        provider_body = self.provider.encode_request(canonical_request)
+        provider_body = provider.encode_request(canonical_request)
         await self.recorder.add_event(rid, "provider_request", provider_body)
 
         try:
-            provider_response = await self.provider.send(provider_body)
+            provider_response = await provider.send(provider_body)
         except ProviderError as exc:
             await self.recorder.add_event(
                 rid,
@@ -104,7 +154,7 @@ class Engine:
 
         await self.recorder.add_event(rid, "provider_response", provider_response)
 
-        canonical_response = self.provider.decode_response(
+        canonical_response = provider.decode_response(
             provider_response, canonical_request_model=canonical_request.model
         )
         await self.recorder.add_event(
@@ -140,23 +190,23 @@ class Engine:
     ) -> AsyncIterator[bytes]:
         """Run a streaming Anthropic-protocol request end-to-end, yielding Anthropic SSE bytes."""
 
-        provider_model = self.provider.map_model(canonical_request.model)
+        provider = self.provider_for(canonical_request.model)
+        provider_model = provider.map_model(canonical_request.model)
         rid = await self.recorder.start_request(
             client_request_id=client_request_id,
             inbound_protocol=ANTHROPIC_PROTOCOL,
             inbound_body=raw_inbound_body,
             canonical_request=canonical_request.model_dump(exclude_none=True),
-            provider=self.provider.name,
+            provider=provider.name,
             provider_model_requested=provider_model,
         )
         await self.recorder.add_event(rid, "inbound_received", raw_inbound_body)
         await self.recorder.add_event(rid, "decoded_canonical", canonical_request.model_dump(exclude_none=True))
 
-        provider_body = self.provider.encode_request(canonical_request)
+        provider_body = provider.encode_request(canonical_request)
         await self.recorder.add_event(rid, "provider_request", provider_body)
 
         recorder = self.recorder
-        provider = self.provider
         canonical_model = canonical_request.model
 
         # We need to (a) yield the Anthropic SSE bytes downstream, (b) record each

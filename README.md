@@ -6,8 +6,14 @@ to non-Anthropic backends — via a canonical, provider-neutral middle layer.
 Point Claude Code's `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` at this
 gateway and the CLI thinks it's talking to Anthropic. Under the hood every
 request is decoded into a `CanonicalRequest`, dispatched to whichever provider
-adapter is registered (v1: xAI Grok), and the response is decoded back into a
-`CanonicalResponse` before being re-encoded to the inbound protocol.
+adapter claims the canonical `model` id, and the response is decoded back
+into a `CanonicalResponse` before being re-encoded to the inbound protocol.
+
+**Backends today:** xAI Grok (`grok-*`) and OpenAI (`gpt-*`, `o1-*`, `o3-*`,
+`o4-*`). Both share the OpenAI chat-completions wire format, so they sit
+behind a common `OpenAICompatibleProvider` base — adding a third
+OpenAI-compatible provider (Groq, Fireworks, Together, OpenRouter, ...) is
+typically a one-file specialization.
 
 ## Architecture: hub-and-spoke, not pairwise
 
@@ -53,9 +59,15 @@ api/
     anthropic.py       # Anthropic <-> canonical  (decode_request, encode_response,
                        #                           encode_stream)
   providers/
-    base.py            # ProviderAdapter protocol
-    xai.py             # xAI Grok adapter        (encode_request, decode_response,
-                       #                           decode_stream + httpx transport)
+    base.py                  # ProviderAdapter protocol
+    openai_compatible.py     # OpenAICompatibleProvider base — all the Canonical
+                             #   <-> /v1/chat/completions translation lives here
+                             #   (encode_request, decode_response, decode_stream
+                             #    + httpx transport)
+    xai.py                   # XAIProvider — thin specialization (model_name_prefixes,
+                             #   twin_override_env_var, settings defaults)
+    openai.py                # OpenAIProvider — same shape, OpenAI bindings
+    registry.py              # ProviderRegistry — model id -> provider dispatch
   shared/
     db.py              # asyncpg pool + schema bootstrap
     schema.sql         # requests + request_events tables
@@ -73,14 +85,14 @@ api/
 
 ## Surface
 
-| Inbound (this gateway, Anthropic shape)            | Outbound (xAI, OpenAI shape)                     |
-|----------------------------------------------------|--------------------------------------------------|
-| `POST /v1/messages` (non-stream)                   | `POST /chat/completions` (`stream: false`)       |
-| `POST /v1/messages` (`Accept: text/event-stream`)  | `POST /chat/completions` (`stream: true`)        |
-| `GET /v1/models`                                   | (static — returns the configured Grok model id)  |
-| `GET /v1/admin/requests` (admin token)             | (local DB)                                       |
-| `GET /v1/admin/requests/{id}` (admin token)        | (local DB)                                       |
-| `GET /health`, `GET /metrics`                      | (local)                                          |
+| Inbound (this gateway, Anthropic shape)            | Outbound (xAI / OpenAI / ...)                                            |
+|----------------------------------------------------|--------------------------------------------------------------------------|
+| `POST /v1/messages` (non-stream)                   | `POST /chat/completions` (`stream: false`) — provider picked by `model`  |
+| `POST /v1/messages` (`Accept: text/event-stream`)  | `POST /chat/completions` (`stream: true`) — provider picked by `model`   |
+| `GET /v1/models`                                   | (static — returns each registered provider's default model id)           |
+| `GET /v1/admin/requests` (admin token)             | (local DB)                                                               |
+| `GET /v1/admin/requests/{id}` (admin token)        | (local DB)                                                               |
+| `GET /health`, `GET /metrics`                      | (local — `/health` lists every registered provider + its claim prefixes) |
 
 **Caller auth (`/v1/messages`, `/v1/models`):** `x-api-key: <token>` **or**
 `Authorization: Bearer <token>` against `GATEWAY_AUTH_TOKEN`. Claude Code's
@@ -133,8 +145,11 @@ is straightforward.
 ## Run locally
 
 ```bash
-# 1. Drop secrets in your shell (~/.bashrc or ~/.zshrc):
+# 1. Drop secrets in your shell (~/.bashrc or ~/.zshrc). The gateway tolerates
+#    an unset key for any backend you don't intend to use — the provider just
+#    raises 500 if/when called.
 export XAI_API_KEY=xai-...
+export OPENAI_API_KEY=sk-...     # optional, only if you'll call gpt-*/o*
 export GATEWAY_AUTH_TOKEN=local-dev-token
 export ADMIN_AUTH_TOKEN=local-dev-admin-token
 
@@ -185,8 +200,10 @@ endpoints still work — the log just doesn't survive a restart.
 export ANTHROPIC_BASE_URL=http://localhost:4011
 export ANTHROPIC_AUTH_TOKEN=$GATEWAY_AUTH_TOKEN
 
-# `--model grok-4` (or whatever GROK_DEFAULT_MODEL is set to) routes to xAI.
-# Anything that doesn't start with `grok` falls back to GROK_DEFAULT_MODEL.
+# `--model grok-*` routes to xAI; `--model gpt-*` / `o1*` / `o3*` / `o4*` routes
+# to OpenAI. Each provider passes a claimed id straight through and falls back
+# to its own configured default for unclaimed ids. An id no provider claims
+# (e.g. `claude-opus-4-7`) returns a 400 listing the available providers.
 claude -p "create hello.py that prints hi" \
   --model grok-4 \
   --output-format json \
@@ -197,18 +214,24 @@ If Claude Code completes the tool dance (Read / Write / Bash all flowed
 through the gateway), `hello.py` exists and the JSON output reports nonzero
 `usage.input_tokens` / `usage.output_tokens`.
 
-### Picking a Grok model id
+### Picking a model id
 
-xAI ships fast — check [the model list](https://docs.x.ai/docs/models) for
-the current top model. Known ids at time of writing:
+The gateway routes by the canonical `model` field. Each provider claims a
+small set of prefixes and falls back to its configured default for anything
+it claims but doesn't recognize.
 
-- `grok-4` (default in `.env.example`)
-- `grok-4-latest`
-- `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning`
-- `grok-3`, `grok-beta` (older)
+**xAI (`grok-*`).** xAI ships fast — check
+[the model list](https://docs.x.ai/docs/models) for the current top.
+Recent ids:
+- `grok-4`, `grok-4-latest`, `grok-4.3`, `grok-4.20-*` reasoning / non-reasoning
+- `grok-4-1-fast-reasoning`, `grok-3`, `grok-beta` (older)
 
-The gateway passes any `grok*` id straight through; non-`grok` ids fall
-back to `GROK_DEFAULT_MODEL`.
+**OpenAI (`gpt-*`, `o1-*`, `o3-*`, `o4-*`).** Check
+[the OpenAI models endpoint](https://platform.openai.com/docs/models). Recent
+mainline tool-use ids: `gpt-5`, `gpt-5-mini`, `gpt-4o`, `o3-mini`, `o4-mini`.
+
+An id no provider claims returns a 400 from the gateway with the available
+providers' prefixes — that's the routing diagnostic.
 
 ## Translation reference
 
@@ -226,24 +249,36 @@ back to `GROK_DEFAULT_MODEL`.
 
 ## Known limits
 
-- **No outbound `cache_control`.** Grok has no prompt-cache equivalent.
-  Inbound `cache_control` is accepted and silently dropped.
-- **No extended thinking on Grok.** `thinking: {...}` and `type: "thinking"`
+- **No outbound `cache_control`.** Neither xAI nor OpenAI's chat-completions
+  endpoint exposes a prompt-cache knob in the same shape Anthropic does.
+  Inbound `cache_control` is accepted and silently dropped. (OpenAI ships
+  automatic prompt caching for repeated prefixes — that's transparent and
+  needs no `cache_control` to engage.)
+- **No extended thinking forwarded.** `thinking: {...}` and `type: "thinking"`
   blocks are accepted on inbound (so prior assistant turns round-trip) and
   preserved in `CanonicalRequest.metadata.anthropic_thinking`; they're not
-  forwarded to xAI.
-- **Single backend per gateway instance.** v1 routes everything to xAI.
-  Multi-provider routing (by model id, by tenant) is a follow-on slice that
-  plugs in at the `engine.run_anthropic`'s ``self.provider`` selection.
+  forwarded to the provider. OpenAI's o-series and GPT-5 do their own
+  reasoning internally; reasoning tokens come back in
+  `usage.completion_tokens` and are propagated to canonical `output_tokens`.
+- **Routing is one-pass, first claimant wins.** The gateway's registry walks
+  registered providers in declaration order. If a model id matches multiple
+  providers, the first-registered one wins — see `api/main.py::_build_registry`.
 
 ## End-to-end verification
 
-Tests in CI use scripted providers — they never hit xAI. Before declaring a
-deploy healthy, run the manual smoke against a real `XAI_API_KEY`:
+Tests in CI use scripted providers — they never hit xAI or OpenAI. Before
+declaring a deploy healthy, run the manual smoke against real keys. Two
+recipes, one per provider; both exercise the same canonical pipeline so
+running both gives you a routing-correctness diagnostic too.
+
+### Provider A — xAI Grok
 
 ```bash
 # In one terminal:
 cd ~/github/pagehub-io/pagehub-llm-gateway
+export XAI_API_KEY=xai-...
+export GATEWAY_AUTH_TOKEN=local-dev-token
+export ADMIN_AUTH_TOKEN=local-dev-admin-token
 make up      # postgres + gateway
 
 # In another, in a scratch dir:
@@ -255,14 +290,50 @@ claude -p "create /tmp/hello-from-grok.py that prints hi" \
   --output-format json \
   --dangerously-skip-permissions
 cat /tmp/hello-from-grok.py
-# Then inspect the log:
-curl -sS http://localhost:4011/v1/admin/requests \
-  -H "x-api-key: $ADMIN_AUTH_TOKEN" | jq '.items[0:5]'
 ```
 
-Acceptance bar: `/tmp/hello-from-grok.py` exists, the JSON output reports
-nonzero `usage` tokens, and `/v1/admin/requests` shows one summary row per
-turn with the full per-event timeline.
+### Provider B — OpenAI (the diagnostic second provider)
+
+```bash
+# Same gateway, different backend. `OPENAI_API_KEY` is required; the gateway
+# routes to OpenAI when the model id starts with `gpt`, `o1`, `o3`, or `o4`.
+cd ~/github/pagehub-io/pagehub-llm-gateway
+export OPENAI_API_KEY=sk-...
+export GATEWAY_AUTH_TOKEN=local-dev-token
+export ADMIN_AUTH_TOKEN=local-dev-admin-token
+make up      # postgres + gateway (no-op if already running)
+
+cd $(mktemp -d) && rm -f hello.py
+ANTHROPIC_BASE_URL=http://localhost:4011 \
+ANTHROPIC_AUTH_TOKEN=$GATEWAY_AUTH_TOKEN \
+claude -p "create hello.py that prints hi" \
+  --model gpt-5 \
+  --output-format json \
+  --dangerously-skip-permissions
+cat hello.py
+```
+
+### Inspect what was logged (both)
+
+```bash
+curl -sS http://localhost:4011/v1/admin/requests \
+  -H "x-api-key: $ADMIN_AUTH_TOKEN" | jq '.items[0:5]'
+curl -sS http://localhost:4011/v1/admin/requests/<id> \
+  -H "x-api-key: $ADMIN_AUTH_TOKEN" | jq
+```
+
+**Acceptance bar (each recipe):** the target file exists with `print` in it,
+the JSON output reports nonzero `usage.input_tokens` / `usage.output_tokens`,
+and `/v1/admin/requests` shows one summary row per turn with the full
+per-event timeline. The `requests.provider` column distinguishes which
+backend served each turn — useful for a quick "did routing work" check.
+
+**Diagnostic value.** If a Grok smoke produces weak output (poor tool use,
+spec-noncompliance, etc.), running the OpenAI recipe on a known-good tool-use
+model (`gpt-5`, `o3-mini`, ...) tells you whether the gateway's canonical
+translation is correct: working OpenAI + broken Grok means Grok is the weak
+link, not the gateway. Both failing in the same shape would point at the
+canonical translation layer.
 
 ## Tests
 
@@ -289,7 +360,8 @@ container so the full suite runs green.
 
 `modal_app.py` is a stub — running `modal deploy modal_app.py` will work, but
 the operator must first provision the `pagehub-llm-gateway` Modal Secret
-containing `XAI_API_KEY`, `GATEWAY_AUTH_TOKEN`, `ADMIN_AUTH_TOKEN`, and a
+containing `XAI_API_KEY` (if using Grok), `OPENAI_API_KEY` (if using OpenAI),
+`GATEWAY_AUTH_TOKEN`, `ADMIN_AUTH_TOKEN`, and a
 `DATABASE_URL` pointing at a managed Postgres (Supabase, RDS, ...). Without
 those env vars the gateway will reject inbound requests OR fall back to
 MemoryRecorder (which means a process restart drops the log). CI does **not**

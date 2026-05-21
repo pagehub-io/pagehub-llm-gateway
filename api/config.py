@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     grok_base_url: str = "https://api.x.ai/v1"
     grok_default_model: str = "grok-4"
 
+    # OpenAI backend (diagnostic second provider — see README "End-to-end
+    # verification"). The gateway routes by canonical model id; xAI claims
+    # ``grok-*`` and OpenAI claims ``gpt-*`` / ``o1-*`` / ``o3-*`` / ``o4-*``.
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_default_model: str = "gpt-5"
+
     # Database — empty string disables DB logging entirely (the engine falls back to
     # an in-memory recorder). Required in production.
     database_url: str = ""

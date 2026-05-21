@@ -5,10 +5,13 @@ NOT auto-deployed by CI — this file is the operator handoff. To actually deplo
     modal deploy modal_app.py
 
 The deployer is responsible for provisioning the runtime secrets:
-``XAI_API_KEY``, ``GATEWAY_AUTH_TOKEN``, ``ADMIN_AUTH_TOKEN``, ``DATABASE_URL``
-(point at a managed Postgres — Supabase / RDS / etc.). Without those the
-gateway will reject inbound requests OR fall back to in-memory logging that
-doesn't survive a restart.
+``XAI_API_KEY`` (if using Grok), ``OPENAI_API_KEY`` (if using OpenAI),
+``GATEWAY_AUTH_TOKEN``, ``ADMIN_AUTH_TOKEN``, ``DATABASE_URL`` (point at a
+managed Postgres — Supabase / RDS / etc.). Either provider key may be unset
+if that backend is unused — the gateway only raises on the first call to a
+provider whose key isn't set. ``DATABASE_URL`` must be set in production;
+without it the gateway falls back to in-memory logging that doesn't survive
+a restart.
 """
 
 from __future__ import annotations

@@ -36,10 +36,34 @@ def get_engine(request: Request) -> Engine:
 
 
 @router.get("/v1/models", response_model=ModelListResponse, dependencies=[Depends(require_auth)])
-async def list_models() -> ModelListResponse:
-    default = settings.grok_default_model
-    info = ModelInfo(id=default, display_name=default, created_at="2024-01-01T00:00:00Z")
-    return ModelListResponse(data=[info], first_id=default, last_id=default, has_more=False)
+async def list_models(request: Request) -> ModelListResponse:
+    """Advertise the default model id of every registered provider. Clients
+    can address other models on those providers by name — these are just the
+    fallback ids the gateway will use when a request omits ``model``."""
+    registry = getattr(request.app.state, "registry", None)
+    legacy = getattr(request.app.state, "provider", None)
+    ids: list[str] = []
+    if registry is not None:
+        for p in registry.providers:
+            m = getattr(p, "default_model", "")
+            if m:
+                ids.append(m)
+    elif legacy is not None:
+        m = getattr(legacy, "default_model", settings.grok_default_model)
+        if m:
+            ids.append(m)
+    if not ids:
+        ids.append(settings.grok_default_model)
+
+    data = [
+        ModelInfo(id=mid, display_name=mid, created_at="2024-01-01T00:00:00Z") for mid in ids
+    ]
+    return ModelListResponse(
+        data=data,
+        first_id=ids[0],
+        last_id=ids[-1],
+        has_more=False,
+    )
 
 
 def _estimate_input_tokens(canonical) -> int:

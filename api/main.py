@@ -11,6 +11,8 @@ from api.config import settings
 from api.engine import Engine
 from api.middleware import BodySizeLimitMiddleware, TwinHeaderMiddleware
 from api.providers.base import ProviderAdapter
+from api.providers.openai import OpenAIProvider
+from api.providers.registry import ProviderRegistry
 from api.providers.xai import XAIProvider
 from api.shared.db import apply_schema, close_pool, init_pool
 from api.shared.recorder import MemoryRecorder, PostgresRecorder, Recorder
@@ -21,14 +23,29 @@ from api.v1.service_router import router as service_router
 logger = logging.getLogger(__name__)
 
 
-def _build_provider() -> ProviderAdapter:
-    return XAIProvider()
+def _build_registry() -> ProviderRegistry:
+    """Order matters: ``pick()`` walks the list and returns the first claim.
+    Adding a new provider is one line here."""
+    return ProviderRegistry(
+        [
+            XAIProvider(),
+            OpenAIProvider(),
+        ]
+    )
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # If the test/build wired a provider in already, respect it.
-    provider: ProviderAdapter = getattr(app.state, "provider", None) or _build_provider()
+    # Provider wiring. Tests may have set either:
+    #   - app.state.registry  (multi-provider, the new way)
+    #   - app.state.provider  (single-provider, the legacy / fake-injection way
+    #     used by tests/conftest.py and tests/test_e2e_app.py)
+    # We respect either, falling back to building the real production
+    # registry from settings.
+    registry: ProviderRegistry | None = getattr(app.state, "registry", None)
+    legacy_provider: ProviderAdapter | None = getattr(app.state, "provider", None)
+    if registry is None and legacy_provider is None:
+        registry = _build_registry()
 
     # Recorder: PostgresRecorder when DATABASE_URL is set, else MemoryRecorder. This
     # keeps the local-dev / no-DB path working out of the box.
@@ -49,8 +66,14 @@ async def lifespan(app: FastAPI):
             logger.info("recorder: memory (DATABASE_URL not set — request log is not persisted)")
         app.state.recorder = recorder
 
-    app.state.provider = provider
-    app.state.engine = Engine(provider=provider, recorder=app.state.recorder)
+    if registry is not None:
+        app.state.registry = registry
+        app.state.engine = Engine(registry=registry, recorder=app.state.recorder)
+    else:
+        # Legacy single-provider path (tests). The engine still routes via its
+        # internal single-provider shim so the request semantics are identical.
+        app.state.provider = legacy_provider
+        app.state.engine = Engine(provider=legacy_provider, recorder=app.state.recorder)
 
     try:
         yield
