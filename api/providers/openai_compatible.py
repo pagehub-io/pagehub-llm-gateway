@@ -23,6 +23,7 @@ them. We do not currently surface reasoning_tokens separately in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -149,11 +150,38 @@ def _encode_tool_choice(tc) -> str | dict[str, Any] | None:
     return None
 
 
+def compute_prompt_cache_key(canonical: CanonicalRequest) -> str:
+    """Stable per-(system+tools) hash, suitable as OpenAI's ``prompt_cache_key``.
+
+    OpenAI auto-caches request prefixes >=1024 tokens, but routing to a
+    consistent cache shard is best-effort without an explicit hint. Setting
+    ``prompt_cache_key`` to a stable value tied to the static portion of the
+    request (system messages + tool definitions) tells OpenAI to route same-
+    key requests to the same shard, dramatically improving hit rate across a
+    multi-turn tool-use loop where the system + tools never change but the
+    message history does.
+
+    The key MUST be deterministic across calls that share the same prefix.
+    We hash the JSON-serialized (system, tools) tuple — message history is
+    intentionally excluded so an Nth-turn continuation hits the cache built
+    by turn 1. Returned value is a 32-char hex digest (well under OpenAI's
+    64-char cap). The hash carries no semantic — it's a routing token only;
+    nothing inside the gateway parses it back.
+    """
+    payload = {
+        "system": [b.model_dump(exclude_none=True) for b in (canonical.system or [])],
+        "tools": [t.model_dump(exclude_none=True) for t in canonical.tools],
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(blob).hexdigest()[:32]
+
+
 def encode_request(
     canonical: CanonicalRequest,
     *,
     target_model: str,
     max_tokens_param_name: str = "max_tokens",
+    cache_key: str | None = None,
 ) -> dict[str, Any]:
     """Canonical -> OpenAI chat-completions request body.
 
@@ -162,6 +190,12 @@ def encode_request(
     GPT-5 / o-series / o4 deprecate it in favor of ``max_completion_tokens``
     and 400 the request if the old name is used. Subclasses pass the right
     value via their ``OpenAICompatibleProvider.max_tokens_param_name`` ClassVar.
+
+    ``cache_key``, when non-None, is emitted as the OpenAI-only
+    ``prompt_cache_key`` parameter. Subclasses that don't speak real OpenAI
+    (i.e. xAI/Grok) should pass ``None`` — the parameter is silently
+    accepted by some compatible-but-not-actual-OpenAI backends but does
+    nothing there. See :func:`compute_prompt_cache_key` for key construction.
     """
     messages: list[dict[str, Any]] = []
     if canonical.system:
@@ -189,6 +223,8 @@ def encode_request(
         "stream": canonical.stream,
         max_tokens_param_name: canonical.max_tokens,
     }
+    if cache_key:
+        body["prompt_cache_key"] = cache_key
     if canonical.temperature is not None:
         body["temperature"] = canonical.temperature
     if canonical.top_p is not None:
@@ -278,11 +314,33 @@ def decode_response(provider_body: dict[str, Any], *, canonical_model: str) -> C
         model=canonical_model,
         content_blocks=blocks,
         stop_reason=_map_finish_reason(finish_reason),
-        usage=CanonicalUsage(
-            input_tokens=int(usage_in.get("prompt_tokens") or 0),
-            output_tokens=int(usage_in.get("completion_tokens") or 0),
-        ),
+        usage=_canonical_usage_from_openai(usage_in),
     )
+
+
+def _canonical_usage_from_openai(usage_in: dict[str, Any]) -> CanonicalUsage:
+    """Map OpenAI's ``usage`` block to ``CanonicalUsage``.
+
+    OpenAI's ``prompt_tokens`` is the TOTAL input including any cached portion;
+    ``prompt_tokens_details.cached_tokens`` is the cached subset (priced 10x
+    cheaper). Canonical convention is "input_tokens excludes cached" (matches
+    Anthropic, matches what downstream cost computations expect). So we split:
+
+        canonical.input_tokens = prompt_tokens - cached_tokens   (uncached only)
+        canonical.cache_tokens = cached_tokens                   (cached subset)
+
+    cache_tokens stays ``None`` when no cached_tokens field is present — that
+    way xAI / older OpenAI responses round-trip unchanged.
+    """
+    total_input = int(usage_in.get("prompt_tokens") or 0)
+    output = int(usage_in.get("completion_tokens") or 0)
+    details = usage_in.get("prompt_tokens_details") or {}
+    cached_raw = details.get("cached_tokens") if isinstance(details, dict) else None
+    if cached_raw in (None, 0):
+        return CanonicalUsage(input_tokens=total_input, output_tokens=output)
+    cached = int(cached_raw)
+    uncached = max(total_input - cached, 0)
+    return CanonicalUsage(input_tokens=uncached, output_tokens=output, cache_tokens=cached)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +369,10 @@ class _StreamState:
     stop_reason: str | None = None
     output_tokens: int = 0
     input_tokens: int = 0
+    # OpenAI's terminal usage frame carries ``prompt_tokens_details.cached_tokens``
+    # when the request hit the prompt cache. Tracked here so MessageDelta carries
+    # the split-out cache_tokens through to the protocol encoders.
+    cache_tokens: int = 0
     started_emitted: bool = False
 
 
@@ -371,8 +433,15 @@ async def decode_stream(
 
         usage = payload.get("usage")
         if usage:
-            state.input_tokens = int(usage.get("prompt_tokens") or state.input_tokens)
+            total_input = int(usage.get("prompt_tokens") or 0) or state.input_tokens
             state.output_tokens = int(usage.get("completion_tokens") or state.output_tokens)
+            details = usage.get("prompt_tokens_details") or {}
+            cached_raw = details.get("cached_tokens") if isinstance(details, dict) else None
+            cached = int(cached_raw) if cached_raw else 0
+            # Same split as the non-streaming path: ``input_tokens`` becomes the
+            # uncached portion only; cached tokens move into their own bucket.
+            state.cache_tokens = cached
+            state.input_tokens = max(total_input - cached, 0)
 
         for choice in payload.get("choices") or []:
             delta = choice.get("delta") or {}
@@ -410,7 +479,9 @@ async def decode_stream(
     yield MessageDelta(
         stop_reason=state.stop_reason or "end_turn",
         usage=CanonicalUsage(
-            input_tokens=state.input_tokens, output_tokens=state.output_tokens
+            input_tokens=state.input_tokens,
+            output_tokens=state.output_tokens,
+            cache_tokens=state.cache_tokens or None,
         ),
     )
     yield StreamDone()
@@ -507,6 +578,13 @@ class OpenAICompatibleProvider:
     # Default is the historical OpenAI spelling; the OpenAI subclass overrides
     # to ``max_completion_tokens`` because GPT-5 / o-series 400 on the old name.
     max_tokens_param_name: ClassVar[str] = "max_tokens"
+    # Real OpenAI exposes a ``prompt_cache_key`` request parameter that hints
+    # the cache layer to route same-key requests to the same shard (10x cheaper
+    # input on hits). xAI/Grok don't have it. Default off; the OpenAI subclass
+    # flips this on. When True, ``encode_request`` computes the key from the
+    # canonical request's (system, tools) static portion — same shape, same
+    # key, cache hit on every continuation.
+    supports_prompt_cache_key: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -539,10 +617,14 @@ class OpenAICompatibleProvider:
     # ------- canonical boundary
 
     def encode_request(self, canonical: CanonicalRequest) -> dict[str, Any]:
+        cache_key = (
+            compute_prompt_cache_key(canonical) if self.supports_prompt_cache_key else None
+        )
         return encode_request(
             canonical,
             target_model=self.map_model(canonical.model),
             max_tokens_param_name=self.max_tokens_param_name,
+            cache_key=cache_key,
         )
 
     def decode_response(

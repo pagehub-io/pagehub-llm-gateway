@@ -219,6 +219,18 @@ class AnthropicInbound:
         if not response_id.startswith("msg_"):
             response_id = f"msg_{response_id}"
 
+        usage_block: dict[str, Any] = {
+            "input_tokens": canonical.usage.input_tokens,
+            "output_tokens": canonical.usage.output_tokens,
+        }
+        # Cached input maps to Anthropic's ``cache_read_input_tokens``.
+        # OpenAI has no separate cache-write rate, so we never emit
+        # ``cache_creation_input_tokens`` — only the read side is meaningful.
+        # The two buckets are non-overlapping in Anthropic's convention, which
+        # matches what the canonical layer produces for OpenAI (see
+        # ``_canonical_usage_from_openai``: input_tokens is uncached only).
+        if canonical.usage.cache_tokens:
+            usage_block["cache_read_input_tokens"] = canonical.usage.cache_tokens
         return {
             "id": response_id,
             "type": "message",
@@ -227,10 +239,7 @@ class AnthropicInbound:
             "content": anth_blocks,
             "stop_reason": canonical.stop_reason,
             "stop_sequence": None,
-            "usage": {
-                "input_tokens": canonical.usage.input_tokens,
-                "output_tokens": canonical.usage.output_tokens,
-            },
+            "usage": usage_block,
         }
 
     # ------------------------------------------------------------------
@@ -317,6 +326,15 @@ class AnthropicInbound:
                     {"type": "content_block_stop", "index": ev.index},
                 )
             elif isinstance(ev, MessageDelta):
+                # Per Anthropic's SSE spec the message_delta's usage block
+                # carries output_tokens (the cumulative final count) plus
+                # input-side counts when the upstream supplies them. We
+                # forward cache_read_input_tokens here whenever the canonical
+                # event carries cache_tokens so consumers see the discount
+                # both on streaming and non-streaming paths.
+                usage_delta: dict[str, Any] = {"output_tokens": ev.usage.output_tokens}
+                if ev.usage.cache_tokens:
+                    usage_delta["cache_read_input_tokens"] = ev.usage.cache_tokens
                 yield _sse(
                     "message_delta",
                     {
@@ -325,7 +343,7 @@ class AnthropicInbound:
                             "stop_reason": ev.stop_reason or "end_turn",
                             "stop_sequence": None,
                         },
-                        "usage": {"output_tokens": ev.usage.output_tokens},
+                        "usage": usage_delta,
                     },
                 )
             elif isinstance(ev, StreamError):
