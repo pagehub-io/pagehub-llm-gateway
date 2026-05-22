@@ -34,6 +34,11 @@ class OpenAIProvider(OpenAICompatibleProvider):
     # both, so the newer name is safe across the board. xAI Grok still wants
     # the historical ``max_tokens`` name.
     max_tokens_param_name = "max_completion_tokens"
+    # Real OpenAI honors ``prompt_cache_key`` — the routing hint that lifts
+    # auto-caching from "best-effort" to "near-deterministic hit rate when the
+    # system+tools prefix is stable" (i.e. across attempts in a multi-turn
+    # tool-use loop). xAI/Grok don't have it.
+    supports_prompt_cache_key = True
 
     def __init__(
         self,

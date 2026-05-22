@@ -260,6 +260,42 @@ def test_encode_response_empty_emits_safe_empty_text():
     assert body["content"] == [{"type": "text", "text": ""}]
 
 
+def test_encode_response_emits_cache_read_input_tokens_when_canonical_has_cache_tokens():
+    """OpenAI's cached_tokens (split out of prompt_tokens by the canonical
+    decoder) maps to Anthropic's cache_read_input_tokens — the two have the
+    same semantic: tokens served at the cache-hit discount. We don't emit
+    cache_creation_input_tokens because OpenAI has no separate cache-write
+    rate (and we have no signal for it)."""
+    cr = CanonicalResponse(
+        id="msg_x",
+        model="gpt-5.5",
+        content_blocks=[CanonicalText(text="ok")],
+        stop_reason="end_turn",
+        usage=CanonicalUsage(input_tokens=100, output_tokens=10, cache_tokens=400),
+    )
+    body = AnthropicInbound.encode_response(cr)
+    assert body["usage"]["input_tokens"] == 100
+    assert body["usage"]["output_tokens"] == 10
+    assert body["usage"]["cache_read_input_tokens"] == 400
+    # cache_creation_input_tokens is NOT emitted — see the docstring above.
+    assert "cache_creation_input_tokens" not in body["usage"]
+
+
+def test_encode_response_omits_cache_read_when_no_cache_tokens():
+    """xAI responses (no caching) and OpenAI cache-miss responses leave
+    canonical.usage.cache_tokens as None — the encoder must NOT emit a
+    zero-valued cache_read_input_tokens (clean wire output for the common case)."""
+    cr = CanonicalResponse(
+        id="msg_x",
+        model="gpt-5",
+        content_blocks=[CanonicalText(text="hi")],
+        stop_reason="end_turn",
+        usage=CanonicalUsage(input_tokens=5, output_tokens=2),
+    )
+    body = AnthropicInbound.encode_response(cr)
+    assert body["usage"] == {"input_tokens": 5, "output_tokens": 2}
+
+
 # ---------------------------------------------------------------------------
 # encode_stream
 # ---------------------------------------------------------------------------
@@ -341,3 +377,44 @@ async def test_encode_stream_empty_stream_still_terminates():
     types = [t for t, _ in events]
     assert types[0] == "message_start"
     assert types[-1] == "message_stop"
+
+
+async def test_encode_stream_message_delta_carries_cache_read_input_tokens():
+    """When canonical's MessageDelta has cache_tokens set, the streaming
+    message_delta SSE event must include cache_read_input_tokens in its
+    usage block — symmetric with the non-streaming encode_response path."""
+    events = await _run_encode(
+        [
+            StreamStart(message_id="msg_c", model="gpt-5.5"),
+            ContentBlockStart(index=0, block=CanonicalText()),
+            ContentTextDelta(index=0, text="hi"),
+            ContentBlockDone(index=0),
+            MessageDelta(
+                stop_reason="end_turn",
+                usage=CanonicalUsage(input_tokens=50, output_tokens=2, cache_tokens=300),
+            ),
+            StreamDone(),
+        ]
+    )
+    deltas = [d for t, d in events if t == "message_delta"]
+    assert len(deltas) == 1
+    usage = deltas[0]["usage"]
+    assert usage["output_tokens"] == 2
+    assert usage["cache_read_input_tokens"] == 300
+
+
+async def test_encode_stream_message_delta_omits_cache_read_when_none():
+    """The negative — no cache_tokens, no cache_read_input_tokens emitted
+    in the streaming message_delta, matching the non-streaming behavior."""
+    events = await _run_encode(
+        [
+            StreamStart(message_id="msg_d", model="grok-4"),
+            ContentBlockStart(index=0, block=CanonicalText()),
+            ContentTextDelta(index=0, text="hi"),
+            ContentBlockDone(index=0),
+            MessageDelta(stop_reason="end_turn", usage=CanonicalUsage(output_tokens=2)),
+            StreamDone(),
+        ]
+    )
+    [delta] = [d for t, d in events if t == "message_delta"]
+    assert delta["usage"] == {"output_tokens": 2}

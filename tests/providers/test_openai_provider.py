@@ -295,3 +295,180 @@ async def test_decode_stream_via_subclass():
 def test_unused_imports():
     # Silence ruff F401 — exported for direct asserts in tests above.
     _ = (CanonicalToolCall,)
+
+
+# ---------------------------------------------------------------------------
+# Prompt caching: request-side cache_key and response-side cached_tokens.
+#
+# OpenAI's /v1/chat/completions does prompt caching automatically for prompts
+# >= 1024 tokens, but routing-to-the-same-cache-shard across requests is
+# best-effort unless you provide a stable ``prompt_cache_key``. The same
+# response carries a ``usage.prompt_tokens_details.cached_tokens`` count that
+# we need to split out of the total ``prompt_tokens`` (which INCLUDES it) so
+# canonical usage maps cleanly to Anthropic's non-overlapping convention.
+# ---------------------------------------------------------------------------
+
+
+def _canonical_with(system: str = "", tools: list | None = None) -> CanonicalRequest:
+    return CanonicalRequest(
+        model="gpt-5",
+        system=[CanonicalText(text=system)] if system else None,
+        messages=[CanonicalMessage(role="user", content_blocks=[CanonicalText(text="hi")])],
+        tools=tools or [],
+        max_tokens=32,
+    )
+
+
+def test_compute_prompt_cache_key_stable_for_same_system_and_tools():
+    from api.providers.openai_compatible import compute_prompt_cache_key
+
+    a = compute_prompt_cache_key(_canonical_with(system="You are X."))
+    b = compute_prompt_cache_key(_canonical_with(system="You are X."))
+    assert a == b
+    # 32-char hex digest = 128 bits, well under OpenAI's 64-char cap
+    assert len(a) == 32 and all(c in "0123456789abcdef" for c in a)
+
+
+def test_compute_prompt_cache_key_differs_when_system_changes():
+    from api.providers.openai_compatible import compute_prompt_cache_key
+
+    a = compute_prompt_cache_key(_canonical_with(system="You are X."))
+    b = compute_prompt_cache_key(_canonical_with(system="You are Y."))
+    assert a != b
+
+
+def test_compute_prompt_cache_key_ignores_message_history():
+    """The message history is the PART OF THE PROMPT THAT CHANGES turn-to-turn;
+    if it factored into the cache key, every continuation would route to a
+    different cache shard and we'd defeat the whole point. Two requests with
+    identical (system, tools) but different messages must produce the same key."""
+    from api.providers.openai_compatible import compute_prompt_cache_key
+
+    a = _canonical_with(system="You are X.")
+    b = _canonical_with(system="You are X.")
+    b.messages = [
+        CanonicalMessage(role="user", content_blocks=[CanonicalText(text="completely different")])
+    ]
+    assert compute_prompt_cache_key(a) == compute_prompt_cache_key(b)
+
+
+def test_openai_subclass_emits_prompt_cache_key_in_body():
+    """The OpenAI provider must wire compute_prompt_cache_key into the
+    outgoing chat-completions body. Without this, OpenAI's caching still
+    works automatically but routing hit rate is best-effort."""
+    p = OpenAIProvider(api_key="k", base_url="x", default_model="gpt-5")
+    body = p.encode_request(_canonical_with(system="You are X."))
+    assert "prompt_cache_key" in body
+    assert isinstance(body["prompt_cache_key"], str)
+    assert len(body["prompt_cache_key"]) == 32
+
+
+def test_openai_subclass_cache_key_is_stable_across_calls_with_same_prefix():
+    p = OpenAIProvider(api_key="k", base_url="x", default_model="gpt-5")
+    b1 = p.encode_request(_canonical_with(system="same"))
+    b2 = p.encode_request(_canonical_with(system="same"))
+    assert b1["prompt_cache_key"] == b2["prompt_cache_key"]
+
+
+def test_xai_subclass_does_NOT_emit_prompt_cache_key():
+    """xAI's chat-completions endpoint accepts the parameter silently but
+    doesn't do anything with it. We omit it entirely to keep the body clean
+    and to avoid implying support that isn't there. The OpenAICompatible base
+    ClassVar ``supports_prompt_cache_key`` defaults to False; only the OpenAI
+    subclass flips it on."""
+    from api.providers.xai import XAIProvider
+
+    p = XAIProvider(api_key="k", base_url="x", default_model="grok-4.3")
+    body = p.encode_request(_canonical_with(system="hello"))
+    assert "prompt_cache_key" not in body
+
+
+def test_decode_response_splits_cached_tokens_out_of_input():
+    """OpenAI's ``prompt_tokens`` is the TOTAL input including any cached
+    portion. Canonical's ``input_tokens`` is the UNCACHED portion only
+    (matches Anthropic's convention and what downstream cost math assumes).
+    So ``input_tokens = prompt_tokens - cached_tokens`` and ``cache_tokens``
+    holds the cached subset separately."""
+    p = OpenAIProvider(api_key="k", base_url="x", default_model="gpt-5")
+    body = {
+        "id": "x",
+        "model": "gpt-5",
+        "choices": [{"index": 0, "message": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 800},
+        },
+    }
+    cr = p.decode_response(body, canonical_request_model="gpt-5")
+    assert cr.usage.input_tokens == 200  # uncached portion
+    assert cr.usage.cache_tokens == 800  # cached subset
+    assert cr.usage.output_tokens == 20
+
+
+def test_decode_response_when_cached_tokens_zero_leaves_cache_tokens_none():
+    """The common no-hit case: cached_tokens is 0 (or absent). Canonical
+    cache_tokens stays None so downstream "cache_tokens is None" checks
+    behave correctly (and the Anthropic encoder doesn't emit a noisy
+    cache_read_input_tokens=0)."""
+    p = OpenAIProvider(api_key="k", base_url="x", default_model="gpt-5")
+    body_zero = {
+        "id": "x",
+        "model": "gpt-5",
+        "choices": [{"index": 0, "message": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        },
+    }
+    cr = p.decode_response(body_zero, canonical_request_model="gpt-5")
+    assert cr.usage.input_tokens == 100
+    assert cr.usage.cache_tokens is None
+
+
+def test_decode_response_when_prompt_tokens_details_absent_unchanged():
+    """A response with no prompt_tokens_details (older models, xAI, etc.)
+    must behave identically to the pre-caching code path."""
+    p = OpenAIProvider(api_key="k", base_url="x", default_model="gpt-5")
+    body = {
+        "id": "x",
+        "model": "gpt-5",
+        "choices": [{"index": 0, "message": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+    cr = p.decode_response(body, canonical_request_model="gpt-5")
+    assert cr.usage.input_tokens == 10
+    assert cr.usage.cache_tokens is None
+
+
+async def test_decode_stream_carries_cache_tokens_in_terminal_message_delta():
+    """The streaming path is symmetric: OpenAI's terminal usage frame can carry
+    prompt_tokens_details.cached_tokens, and our MessageDelta event must
+    surface it via CanonicalUsage.cache_tokens so the Anthropic encoder can
+    emit cache_read_input_tokens in the final message_delta SSE event."""
+    from api.canonical.events import MessageDelta as MD
+
+    p = OpenAIProvider(api_key="k", base_url="x", default_model="gpt-5")
+    chunks = [
+        _chunk({"id": "x", "choices": [{"index": 0, "delta": {"content": "ok"}}]}),
+        _chunk({"id": "x", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        _chunk(
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 500,
+                    "completion_tokens": 10,
+                    "prompt_tokens_details": {"cached_tokens": 400},
+                },
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    events = []
+    async for ev in p.decode_stream(_aiter(chunks), canonical_request_model="gpt-5"):
+        events.append(ev)
+    [delta] = [e for e in events if isinstance(e, MD)]
+    assert delta.usage.input_tokens == 100  # 500 total - 400 cached
+    assert delta.usage.cache_tokens == 400
+    assert delta.usage.output_tokens == 10
